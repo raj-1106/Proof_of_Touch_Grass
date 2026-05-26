@@ -1,6 +1,6 @@
 import { parseAbi } from "viem";
 
-export const CONTRACT_ADDRESS = "0x8F2b1BC63D44fdCae1d3081D9F3EB3C465503788" as const;
+export const CONTRACT_ADDRESS = "0x431Fb77991919b47D7f54f18d393490707819561" as const;
 
 // Sepolia testnet USDC (Circle's official testnet USDC)
 export const USDC_ADDRESS = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238" as const;
