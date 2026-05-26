@@ -107,25 +107,36 @@ const FALLBACK_META: ChallengeMeta = { name: "Unnamed Challenge", description: "
 // back to "Unnamed Challenge" if the fetch or parse fails so the UI never
 // shows a blank card.
 const metaCache: Record<string, ChallengeMeta> = {};
+
+// Fetch metadata JSON from Pinata with up to 3 attempts + exponential back-off.
+// Only caches successful results so that transient failures are retried next session.
 async function fetchMetaFromIPFS(cid: string): Promise<ChallengeMeta> {
   if (!isValidCID(cid)) return FALLBACK_META;
   if (metaCache[cid]) return metaCache[cid];
-  try {
-    const url = `${IPFS_GATEWAY}${cid}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) throw new Error(`fetch ${res.status}`);
-    const json = await res.json();
-    const meta: ChallengeMeta = {
-      name: (typeof json.name === "string" && json.name.trim()) || "Unnamed Challenge",
-      description: typeof json.description === "string" ? json.description : "",
-      image: resolveIpfsUrl(json.image),
-    };
-    metaCache[cid] = meta;
-    return meta;
-  } catch (e) {
-    console.warn("metadata fetch failed for", cid, e);
-    return FALLBACK_META;
+  const url = `${IPFS_GATEWAY}${cid}`;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const resolved: ChallengeMeta = {
+        name: (typeof json.name === "string" && json.name.trim()) || "Unnamed Challenge",
+        description: typeof json.description === "string" ? json.description : "",
+        // Replace ipfs:// prefix with Pinata gateway URL
+        image: resolveIpfsUrl(json.image),
+      };
+      metaCache[cid] = resolved;
+      return resolved;
+    } catch (e) {
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+        continue;
+      }
+      console.warn("metadata fetch failed for", cid, e);
+      return FALLBACK_META;
+    }
   }
+  return FALLBACK_META;
 }
 
 // Convert CID to a displayable image URL (only if valid CID)
@@ -138,20 +149,30 @@ function ipfsImageUrl(cid: string): string | null {
 
 function useChallengesMeta(challenges: Challenge[]) {
   const [meta, setMeta] = useState<Record<number, ChallengeMeta>>({});
-  // Track by CID string (not ID) so that when a real CID arrives after the
-  // initial empty-string render, we still fetch — without duplicate requests.
-  const fetchedCIDs = useRef<Set<string>>(new Set());
+  // Track CURRENTLY IN-FLIGHT requests only (not permanently "done" like the old
+  // fetchedCIDs set). This means a failed fetch is retried the next time the
+  // challenges array updates (every ~15 s via refetchInterval), while concurrent
+  // duplicate requests for the same CID are still prevented.
+  const inFlight = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     challenges.forEach((c) => {
-      // CID not yet loaded from event logs — skip rather than setting fallback,
-      // because the effect will re-run when the CID arrives.
+      // CID not yet available from event logs — wait for it.
       if (!c.metadataCID) return;
-      // Already requested this exact CID.
-      if (fetchedCIDs.current.has(c.metadataCID)) return;
-      fetchedCIDs.current.add(c.metadataCID);
-      fetchMetaFromIPFS(c.metadataCID).then((m) => {
-        setMeta((prev) => ({ ...prev, [c.id]: m }));
+      // Already successfully fetched — sync from module-level cache to state.
+      if (metaCache[c.metadataCID]) {
+        setMeta((prev) => {
+          if (prev[c.id] === metaCache[c.metadataCID]) return prev;
+          return { ...prev, [c.id]: metaCache[c.metadataCID] };
+        });
+        return;
+      }
+      // A fetch for this CID is already in progress — don't start a duplicate.
+      if (inFlight.current.has(c.metadataCID)) return;
+      inFlight.current.add(c.metadataCID);
+      fetchMetaFromIPFS(c.metadataCID).then((resolved) => {
+        inFlight.current.delete(c.metadataCID); // clear so failures can retry
+        setMeta((prev) => ({ ...prev, [c.id]: resolved }));
       });
     });
   }, [challenges]);
@@ -346,6 +367,10 @@ const ChallengeCard = ({ challenge, meta, onClick, highlight }: {
   const timeRef = status === "voting" ? challenge.votingDeadline : challenge.deadline;
   const proofImageUrl = challenge.proofCID ? ipfsImageUrl(challenge.proofCID) : null;
   const thumbUrl = proofImageUrl || meta?.image || null;
+  // meta===undefined means IPFS fetch hasn't resolved yet (either CID still
+  // loading from events, or metadata fetch in-flight).
+  const isLoadingMeta = !!challenge.metadataCID && meta === undefined;
+  const [imgErr, setImgErr] = useState(false);
 
   const { data: payoutData } = useReadContract({
     address: CONTRACT_ADDRESS,
@@ -392,29 +417,45 @@ const ChallengeCard = ({ challenge, meta, onClick, highlight }: {
         : "bg-reject"
       }`} />
 
-      {/* Image thumbnail — proof photo if submitted, else metadata cover image */}
-      {thumbUrl && (
+      {/* Image thumbnail — proof photo, metadata cover image, loading skeleton, or nothing */}
+      {thumbUrl && !imgErr ? (
         <div className="h-32 overflow-hidden relative bg-muted">
           <img
             src={thumbUrl}
             alt={proofImageUrl ? "Proof" : "Challenge"}
             className="w-full h-full object-cover"
-            onError={(e) => { (e.currentTarget as HTMLImageElement).src = "/placeholder.svg"; }}
+            onError={() => setImgErr(true)}
           />
           <div className="absolute inset-0 bg-gradient-to-t from-card/80 to-transparent" />
         </div>
-
-      )}
+      ) : imgErr ? (
+        <div className="h-32 flex items-center justify-center bg-muted/50 border-b border-border">
+          <span className="text-4xl opacity-25">🌿</span>
+        </div>
+      ) : isLoadingMeta ? (
+        <div className="h-32 bg-muted animate-pulse flex items-center justify-center">
+          <span className="text-3xl opacity-10">🌿</span>
+        </div>
+      ) : null}
 
       <div className="p-5">
         <div className="flex items-start justify-between mb-3">
           <div className="flex-1 min-w-0 pr-2">
             <p className="text-xs text-muted-foreground font-medium mb-0.5">#{challenge.id} · {truncateAddr(challenge.creator)}</p>
-            <p className="text-base font-bold text-foreground font-display truncate">
-              {meta?.name || "Unnamed Challenge"}
-            </p>
-            {meta?.description && (
-              <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2 leading-relaxed">{meta.description}</p>
+            {isLoadingMeta ? (
+              <div className="space-y-1.5 mt-0.5">
+                <div className="h-4 w-36 bg-muted animate-pulse rounded" />
+                <div className="h-3 w-48 bg-muted/60 animate-pulse rounded" />
+              </div>
+            ) : (
+              <>
+                <p className="text-base font-bold text-foreground font-display truncate">
+                  {meta?.name || "Unnamed Challenge"}
+                </p>
+                {meta?.description && (
+                  <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2 leading-relaxed">{meta.description}</p>
+                )}
+              </>
             )}
           </div>
           <StatusBadge status={status} />
@@ -536,6 +577,8 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
   const [uploadedCID, setUploadedCID] = useState<string | null>(null);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [voteChoice, setVoteChoice] = useState<boolean | null>(null);
+  const [proofImgErr, setProofImgErr] = useState(false);
+  const isLoadingMeta = !!challenge.metadataCID && meta === undefined;
   const isCreator = address?.toLowerCase() === challenge.creator.toLowerCase();
 
   const proofImageUrl = challenge.proofCID ? ipfsImageUrl(challenge.proofCID) : null;
@@ -624,11 +667,20 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
           <div className="flex items-start justify-between mb-5">
             <div className="flex-1 min-w-0 pr-3">
               <p className="text-xs text-muted-foreground font-medium mb-1">Challenge #{challenge.id} · {truncateAddr(challenge.creator)}</p>
-              <h2 className="text-2xl font-bold font-display text-foreground leading-tight">
-                {meta?.name || "Unnamed Challenge"}
-              </h2>
-              {meta?.description && (
-                <p className="text-sm text-muted-foreground mt-1.5 leading-relaxed">{meta.description}</p>
+              {isLoadingMeta ? (
+                <div className="space-y-2 mt-1">
+                  <div className="h-7 w-56 bg-muted animate-pulse rounded-lg" />
+                  <div className="h-4 w-72 bg-muted/60 animate-pulse rounded" />
+                </div>
+              ) : (
+                <>
+                  <h2 className="text-2xl font-bold font-display text-foreground leading-tight">
+                    {meta?.name || "Unnamed Challenge"}
+                  </h2>
+                  {meta?.description && (
+                    <p className="text-sm text-muted-foreground mt-1.5 leading-relaxed">{meta.description}</p>
+                  )}
+                </>
               )}
             </div>
             <div className="flex items-center gap-3 shrink-0">
@@ -647,18 +699,30 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
           {/* Proof image from IPFS */}
           {proofImageUrl && (
             <>
-              <div className="mb-5 rounded-2xl overflow-hidden border border-border group cursor-zoom-in" onClick={() => setLightboxOpen(true)}>
-                <div className="relative">
-                  <img src={proofImageUrl} alt="Proof" className="w-full max-h-64 object-cover" onError={(e) => { (e.currentTarget as HTMLImageElement).src = "/placeholder.svg"; }} />
-                  <div className="absolute inset-0 bg-foreground/0 group-hover:bg-foreground/20 transition-all flex items-center justify-center">
-                    <span className="opacity-0 group-hover:opacity-100 transition-opacity bg-foreground/70 text-background text-xs font-semibold px-3 py-1.5 rounded-full flex items-center gap-1.5">
-                      <ImageIcon className="w-3.5 h-3.5" /> Click to enlarge
-                    </span>
+              <div className="mb-5 rounded-2xl overflow-hidden border border-border group cursor-zoom-in" onClick={() => !proofImgErr && setLightboxOpen(true)}>
+                {proofImgErr ? (
+                  <div className="flex flex-col items-center justify-center h-40 bg-muted/50 gap-2">
+                    <span className="text-4xl opacity-30">🌿</span>
+                    <p className="text-xs text-muted-foreground">Image unavailable</p>
                   </div>
-                </div>
+                ) : (
+                  <div className="relative">
+                    <img
+                      src={proofImageUrl}
+                      alt="Proof"
+                      className="w-full max-h-64 object-cover"
+                      onError={() => setProofImgErr(true)}
+                    />
+                    <div className="absolute inset-0 bg-foreground/0 group-hover:bg-foreground/20 transition-all flex items-center justify-center">
+                      <span className="opacity-0 group-hover:opacity-100 transition-opacity bg-foreground/70 text-background text-xs font-semibold px-3 py-1.5 rounded-full flex items-center gap-1.5">
+                        <ImageIcon className="w-3.5 h-3.5" /> Click to enlarge
+                      </span>
+                    </div>
+                  </div>
+                )}
                 <div className="px-4 py-2.5 bg-muted/40 flex items-center gap-2 text-xs text-muted-foreground">
                   <ImageIcon className="w-3.5 h-3.5" />
-                  <span>Proof photo · stored on IPFS · visible to everyone · click to expand</span>
+                  <span>Proof photo · stored on IPFS · visible to everyone{!proofImgErr && " · click to expand"}</span>
                 </div>
               </div>
 
@@ -680,7 +744,7 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
                       className="relative max-w-3xl w-full"
                       onClick={(e) => e.stopPropagation()}
                     >
-                      <img src={proofImageUrl} alt="Proof fullsize" className="w-full max-h-[80vh] object-contain rounded-2xl shadow-elevated" />
+                      <img src={proofImageUrl} alt="Proof fullsize" className="w-full max-h-[80vh] object-contain rounded-2xl shadow-elevated" onError={() => setProofImgErr(true)} />
                       <button
                         onClick={() => setLightboxOpen(false)}
                         className="absolute top-3 right-3 p-2 rounded-full bg-foreground/60 hover:bg-foreground/80 text-background transition-colors"
@@ -1691,12 +1755,12 @@ export default function Index() {
             challenge={challenges.find((c) => c.id === selected.id) ?? selected}
             meta={meta[selected.id]}
             onClose={() => setSelected(null)}
-            onVoted={() => { setSelected(null); refetchChallenges(); }}
+            onVoted={() => { setSelected(null); refetch(); }}
             onHide={handleHide}
           />
         )}
         {showCreate && (
-          <CreateModal key="create" onClose={() => setShowCreate(false)} onRefetch={refetchChallenges} />
+          <CreateModal key="create" onClose={() => setShowCreate(false)} onRefetch={refetch} />
         )}
       </AnimatePresence>
     </div>
