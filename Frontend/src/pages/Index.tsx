@@ -17,7 +17,7 @@ import {
   usePublicClient,
 } from "wagmi";
 import { sepolia } from "wagmi/chains";
-import { CONTRACT_ADDRESS, CONTRACT_ABI, USDC_ADDRESS, USDC_ABI, STAKE_AMOUNT } from "@/lib/contract";
+import { CONTRACT_ADDRESS, CONTRACT_ABI, USDC_ADDRESS, USDC_ABI, STAKE_AMOUNT, CREATOR_STAKE, VOTER_STAKE, PROTOCOL_FEE_BPS } from "@/lib/contract";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -35,6 +35,9 @@ interface Challenge {
   proofSubmitted: boolean;
   resolved: boolean;
   success: boolean;
+  creatorClaimed: boolean;
+  creatorPrizePool: bigint;
+  voterPrizePool: bigint;
 }
 
 interface ChallengeMeta {
@@ -158,6 +161,31 @@ function useChallengesMeta(challenges: Challenge[]) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+export function formatUSDC(amount: bigint | string | number): string {
+  return (Number(amount) / 1_000_000).toFixed(2) + " USDC";
+}
+
+export function approvePool(approveVotes: number): bigint {
+  return BigInt(approveVotes) * VOTER_STAKE;
+}
+
+export function rejectPool(rejectVotes: number): bigint {
+  return BigInt(rejectVotes) * VOTER_STAKE;
+}
+
+export function creatorPrizeOnApprove(rejectVotes: number): bigint {
+  const pool = rejectPool(rejectVotes);
+  const fee = (pool * PROTOCOL_FEE_BPS) / 10000n;
+  return CREATOR_STAKE + pool - fee;
+}
+
+export function voterPrizeShareOnReject(approveVotes: number, rejectVotes: number): bigint {
+  const prize = CREATOR_STAKE + approvePool(approveVotes);
+  const fee = (prize * PROTOCOL_FEE_BPS) / 10000n;
+  const net = prize - fee;
+  return rejectVotes > 0 ? net / BigInt(rejectVotes) : 0n;
+}
+
 function getChallengeStatus(c: Challenge): ChallengeStatus {
   if (c.resolved) return c.success ? "resolved_success" : "resolved_fail";
   if (c.proofSubmitted && c.votingDeadline > 0) {
@@ -179,6 +207,36 @@ function formatTimeLeft(deadline: number): string {
 
 function truncateAddr(addr: string) {
   return addr.length > 10 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+}
+
+function formatError(error: Error | null): string {
+  if (!error) return "";
+  const msg = error.message || "";
+  if (msg.includes("Reentrant")) return "Transaction in progress, please wait";
+  if (msg.includes("NotOwner")) return "Only the contract owner can do this";
+  if (msg.includes("ZeroAddress")) return "Invalid address";
+  if (msg.includes("InvalidDuration")) return "Duration must be between 1 second and 365 days";
+  if (msg.includes("InvalidCID")) return "Invalid IPFS CID — please re-upload to Pinata";
+  if (msg.includes("NotCreator")) return "Only the challenge creator can do this";
+  if (msg.includes("ChallengeExpired")) return "Challenge deadline has passed";
+  if (msg.includes("AlreadySubmitted")) return "Proof already submitted for this challenge";
+  if (msg.includes("NoProofYet")) return "Creator hasn't submitted proof yet";
+  if (msg.includes("VotingEnded")) return "Voting window has closed";
+  if (msg.includes("AlreadyVoted")) return "You have already voted on this challenge";
+  if (msg.includes("CreatorCannotVote")) return "Challenge creators cannot vote on their own challenge";
+  if (msg.includes("AlreadyResolved")) return "This challenge has already been resolved";
+  if (msg.includes("DeadlineNotPassed")) return "Challenge deadline hasn't passed yet";
+  if (msg.includes("VotingOngoing")) return "Voting is still in progress";
+  if (msg.includes("NotResolved")) return "Challenge hasn't been resolved yet";
+  if (msg.includes("ChallengeFailed")) return "Challenge was rejected — nothing to claim";
+  if (msg.includes("AlreadyClaimed")) return "Reward already claimed";
+  if (msg.includes("LosingSideVoter")) return "You voted on the losing side — no reward";
+  if (msg.includes("NoCorrectVoters")) return "No correct voters found";
+  if (msg.includes("InsufficientPool")) return "Prize pool is empty";
+  if (msg.includes("ExceedsTreasury")) return "Amount exceeds treasury balance";
+  if (msg.includes("NoRewardAvailable")) return "No reward available to claim";
+  if (msg.includes("INSUFFICIENT_FUNDS")) return "Not enough ETH for gas fees";
+  return msg.split("\n")[0]?.slice(0, 100) ?? "Transaction failed";
 }
 
 // ── TxButton ─ reusable wagmi write + wait button ─────────────────────────────
@@ -225,7 +283,7 @@ function TxButton({ label, pendingLabel, icon, className = "", disabled, args, f
       {error && (
         <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex items-start gap-1.5 text-xs text-reject">
           <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-          {(error as Error).message?.split("\n")[0]?.slice(0, 100) ?? "Transaction failed"}
+          {(error as Error).message ? formatError(error as Error) : "Transaction failed"}
         </motion.p>
       )}
       {isSuccess && (
@@ -283,10 +341,37 @@ const VoteBar = ({ approve, reject }: { approve: number; reject: number }) => {
 const ChallengeCard = ({ challenge, meta, onClick, highlight }: {
   challenge: Challenge; meta?: ChallengeMeta; onClick: () => void; highlight?: boolean;
 }) => {
+  const { address } = useAccount();
   const status = getChallengeStatus(challenge);
   const timeRef = status === "voting" ? challenge.votingDeadline : challenge.deadline;
   const proofImageUrl = challenge.proofCID ? ipfsImageUrl(challenge.proofCID) : null;
   const thumbUrl = proofImageUrl || meta?.image || null;
+
+  const { data: payoutData } = useReadContract({
+    address: CONTRACT_ADDRESS,
+    abi: CONTRACT_ABI,
+    functionName: "previewPayout",
+    args: address ? [BigInt(challenge.id), address] : undefined,
+    query: { enabled: !!address },
+  });
+  const payout = payoutData?.[0] as bigint | undefined;
+  const role = payoutData?.[1] as string | undefined;
+
+  let rewardText = "";
+  if (status === "resolved_success" || status === "resolved_fail") {
+    if (role === "creator") {
+      if (challenge.success) rewardText = payout && payout > 0n ? `Claim ${formatUSDC(payout)}` : "Already claimed";
+      else rewardText = "No reward — failed";
+    } else if (role === "voter") {
+      if (payout && payout > 0n) rewardText = `Claim ${formatUSDC(payout)}`;
+      else rewardText = "No reward — wrong side or claimed";
+    } else {
+      rewardText = "No reward";
+    }
+  } else {
+    rewardText = "Pending resolution";
+  }
+
 
   return (
     <motion.div
@@ -338,8 +423,34 @@ const ChallengeCard = ({ challenge, meta, onClick, highlight }: {
         {(status === "voting" || status === "resolved_success" || status === "resolved_fail") && (
           <div className="mb-3">
             <VoteBar approve={challenge.approveVotes} reject={challenge.rejectVotes} />
+            <div className="flex justify-between text-[10px] mt-1 text-muted-foreground">
+              <span>Approve pool: {formatUSDC(approvePool(challenge.approveVotes))}</span>
+              <span>Reject pool: {formatUSDC(rejectPool(challenge.rejectVotes))}</span>
+            </div>
+            <div className="text-[10px] text-center mt-0.5 text-muted-foreground font-semibold">
+              Total at stake: {formatUSDC(CREATOR_STAKE + approvePool(challenge.approveVotes) + rejectPool(challenge.rejectVotes))}
+            </div>
           </div>
         )}
+
+        {(status === "resolved_success" || status === "resolved_fail") && (
+          <div className="mb-3 text-xs border border-border rounded-xl p-2.5 bg-muted/20">
+            <div className="flex justify-between items-center">
+              <span className="text-muted-foreground">Creator Prize:</span>
+              <span className="font-semibold text-foreground">{formatUSDC(challenge.creatorPrizePool)}</span>
+            </div>
+            <div className="flex justify-between items-center mt-1.5 pt-1.5 border-t border-border">
+              <span className="text-muted-foreground">Voter Prize Pool:</span>
+              <span className="font-semibold text-foreground">{formatUSDC(challenge.voterPrizePool)}</span>
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between mb-3">
+          <div className="text-xs font-semibold text-primary bg-primary/10 px-2 py-1 rounded-md">
+            {address ? rewardText : "Connect wallet"}
+          </div>
+        </div>
 
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -424,6 +535,7 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadedCID, setUploadedCID] = useState<string | null>(null);
   const [lightboxOpen, setLightboxOpen] = useState(false);
+  const [voteChoice, setVoteChoice] = useState<boolean | null>(null);
   const isCreator = address?.toLowerCase() === challenge.creator.toLowerCase();
 
   const proofImageUrl = challenge.proofCID ? ipfsImageUrl(challenge.proofCID) : null;
@@ -435,6 +547,16 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
     args: [BigInt(challenge.id), address ?? "0x0000000000000000000000000000000000000000"],
     query: { enabled: !!address },
   });
+
+  const { data: payoutData } = useReadContract({
+    address: CONTRACT_ADDRESS,
+    abi: CONTRACT_ABI,
+    functionName: "previewPayout",
+    args: address ? [BigInt(challenge.id), address] : undefined,
+    query: { enabled: !!address },
+  });
+  const payout = payoutData?.[0] as bigint | undefined;
+  const role = payoutData?.[1] as string | undefined;
 
   // rewardClaimed mapping is internal in the new contract; we optimistically
   // show the claim button and let the contract revert with AlreadyClaimed if so.
@@ -668,35 +790,39 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
           )}
 
           {/* ── Vote (non-creator, voting open, not voted) */}
-          {status === "voting" && !isCreator && !alreadyVoted && (
+          {status === "voting" && !isCreator && !alreadyVoted && voteChoice === null && (
             <div className="space-y-3 pt-2">
               <div className="p-3 rounded-xl bg-pending-light border border-pending/20">
                 <p className="text-sm font-semibold font-display text-pending mb-1">🗳️ Your vote is needed!</p>
-                <p className="text-xs text-muted-foreground">Does the photo above show the challenger actually touched grass?</p>
+                <p className="text-xs text-muted-foreground">Does the photo above show the challenger actually touched grass? (Costs 0.10 USDC to vote)</p>
               </div>
               <div className="grid grid-cols-2 gap-3 items-start">
-                <TxButton
-                  functionName="vote"
-                  args={[BigInt(challenge.id), true]}
-                  label="✓ Approve"
-                  pendingLabel="Voting…"
-                  icon={<CheckCircle className="w-4 h-4" />}
+                <button
+                  onClick={() => setVoteChoice(true)}
                   disabled={!address}
-                  className="w-full py-3.5 rounded-xl bg-approve text-white font-bold text-sm hover:opacity-90 shadow-sm"
-                  onSuccess={handleVoteSuccess}
-                />
-                <TxButton
-                  functionName="vote"
-                  args={[BigInt(challenge.id), false]}
-                  label="✗ Reject"
-                  pendingLabel="Voting…"
-                  icon={<XCircle className="w-4 h-4" />}
+                  className="w-full py-3.5 rounded-xl bg-approve text-white font-bold text-sm hover:opacity-90 shadow-sm flex justify-center items-center gap-2 transition-all disabled:opacity-50"
+                >
+                  <CheckCircle className="w-4 h-4" /> ✓ Approve
+                </button>
+                <button
+                  onClick={() => setVoteChoice(false)}
                   disabled={!address}
-                  className="w-full py-3.5 rounded-xl bg-reject text-white font-bold text-sm hover:opacity-90 shadow-sm"
-                  onSuccess={handleVoteSuccess}
-                />
+                  className="w-full py-3.5 rounded-xl bg-reject text-white font-bold text-sm hover:opacity-90 shadow-sm flex justify-center items-center gap-2 transition-all disabled:opacity-50"
+                >
+                  <XCircle className="w-4 h-4" /> ✗ Reject
+                </button>
               </div>
             </div>
+          )}
+
+          {voteChoice !== null && address && (
+            <ApproveAndVote
+               challengeId={challenge.id}
+               approveVote={voteChoice}
+               address={address}
+               onSuccess={handleVoteSuccess}
+               onCancel={() => setVoteChoice(null)}
+            />
           )}
 
           {alreadyVoted && status === "voting" && (
@@ -707,7 +833,10 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
           )}
 
           {/* ── Resolve */}
-          {challenge.proofSubmitted && votingEnded && !challenge.resolved && (
+          {(
+             (challenge.proofSubmitted && votingEnded && !challenge.resolved) ||
+             (!challenge.proofSubmitted && Date.now() > challenge.deadline && !challenge.resolved)
+          ) && (
             <TxButton
               functionName="resolve"
               args={[BigInt(challenge.id)]}
@@ -721,11 +850,11 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
           )}
 
           {/* ── Claim stake (creator) */}
-          {status === "resolved_success" && isCreator && (
+          {status === "resolved_success" && isCreator && !challenge.creatorClaimed && (
             <TxButton
               functionName="claim"
               args={[BigInt(challenge.id)]}
-              label="Claim 1 USDC"
+              label={`Claim ${formatUSDC(challenge.creatorPrizePool)}`}
               pendingLabel="Claiming…"
               icon={<Coins className="w-4 h-4" />}
               disabled={!address}
@@ -735,11 +864,11 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
           )}
 
           {/* ── Claim voter reward */}
-          {challenge.resolved && alreadyVoted && !rewardClaimed && (
+          {challenge.resolved && alreadyVoted && role === "voter" && payout && payout > 0n && (
             <TxButton
               functionName="claimVoterReward"
               args={[BigInt(challenge.id)]}
-              label="Claim Voter Reward"
+              label={`Claim ${formatUSDC(payout)}`}
               pendingLabel="Claiming…"
               icon={<Coins className="w-4 h-4" />}
               disabled={!address}
@@ -763,6 +892,126 @@ const ChallengeModal = ({ challenge, meta, onClose, onVoted, onHide }: {
     </motion.div>
   );
 };
+
+function ApproveAndVote({ challengeId, approveVote, address, onSuccess, onCancel }: {
+  challengeId: number;
+  approveVote: boolean;
+  address: `0x${string}`;
+  onSuccess: () => void;
+  onCancel: () => void;
+}) {
+  const { data: allowance, refetch: refetchAllowance } = useReadContract({
+    address: USDC_ADDRESS, abi: USDC_ABI, functionName: "allowance", args: [address, CONTRACT_ADDRESS],
+  });
+  const { data: balance } = useReadContract({
+    address: USDC_ADDRESS, abi: USDC_ABI, functionName: "balanceOf", args: [address],
+  });
+
+  const needsApproval = !allowance || (allowance as bigint) < VOTER_STAKE;
+  const hasEnough = balance !== undefined && (balance as bigint) >= VOTER_STAKE;
+
+  const { writeContract: approve, data: approveHash, isPending: approvePending, error: approveError } = useWriteContract();
+  const { isLoading: approveConfirming, isSuccess: approveSuccess } = useWaitForTransactionReceipt({ hash: approveHash });
+
+  const { writeContract: voteFn, data: voteHash, isPending: votePending, error: voteError } = useWriteContract();
+  const { isLoading: voteConfirming, isSuccess: voteConfirmed } = useWaitForTransactionReceipt({ hash: voteHash });
+
+  useEffect(() => { if (approveSuccess) refetchAllowance(); }, [approveSuccess, refetchAllowance]);
+
+  useEffect(() => {
+    if (voteConfirmed) {
+      onSuccess();
+    }
+  }, [voteConfirmed]);
+
+  const handleApprove = () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    approve({ address: USDC_ADDRESS, abi: USDC_ABI, functionName: "approve", args: [CONTRACT_ADDRESS, VOTER_STAKE] } as any);
+  };
+
+  const handleVote = () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    voteFn({
+      address: CONTRACT_ADDRESS,
+      abi: CONTRACT_ABI,
+      functionName: "vote",
+      args: [BigInt(challengeId), approveVote],
+    } as any);
+  };
+
+  const usdcBalance = balance !== undefined ? (Number(balance as bigint) / 1e6).toFixed(2) : "…";
+
+  const inFlight = votePending || voteConfirming;
+  let statusLabel = `Vote ${approveVote ? "Approve" : "Reject"}`;
+  if (votePending) statusLabel = "Staking 0.10 USDC…";
+  else if (voteConfirming) statusLabel = "Confirming…";
+
+  return (
+    <div className="space-y-4 p-4 border border-border rounded-xl bg-card shadow-sm mt-4">
+      <div className="text-center space-y-1">
+        <h3 className="font-semibold text-foreground">Confirm your vote</h3>
+        <p className="text-xs text-muted-foreground">Voting requires a <span className="font-bold text-foreground">0.10 USDC stake</span>.</p>
+        <p className="text-xs text-muted-foreground">If you vote correctly you get 0.10 USDC back plus a share of the opposing side. If you vote incorrectly you lose 0.10 USDC.</p>
+      </div>
+
+      <div className={`flex items-center justify-between px-4 py-2.5 rounded-xl border text-sm ${
+        hasEnough ? "bg-approve-light border-approve/20 text-approve" : "bg-reject-light border-reject/20 text-reject"
+      }`}>
+        <span className="font-semibold">Your USDC Balance</span>
+        <span className="font-bold">{usdcBalance} USDC</span>
+      </div>
+
+      {!hasEnough && (
+        <div className="flex items-start gap-2 p-3 rounded-xl bg-reject-light border border-reject/20 text-reject text-xs">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>You need at least 0.10 testnet USDC.</span>
+        </div>
+      )}
+
+      {needsApproval ? (
+        <div className="space-y-2">
+          <motion.button
+            whileTap={{ scale: 0.97 }}
+            disabled={approvePending || approveConfirming || !hasEnough}
+            onClick={handleApprove}
+            className="w-full py-3.5 rounded-xl bg-accent text-foreground font-bold text-sm hover:opacity-90 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+          >
+            {approvePending || approveConfirming ? (
+              <><Loader2 className="w-4 h-4 animate-spin" /> Approving USDC…</>
+            ) : (
+              <><Coins className="w-4 h-4" /> Approve 0.10 USDC First</>
+            )}
+          </motion.button>
+          {approveError && (
+             <p className="text-xs text-reject">{formatError(approveError as Error)}</p>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <motion.button
+            whileTap={{ scale: 0.97 }}
+            disabled={!hasEnough || inFlight}
+            onClick={handleVote}
+            className={`w-full py-3.5 rounded-xl text-white font-bold text-sm flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed transition-all ${approveVote ? "bg-approve" : "bg-reject"}`}
+          >
+            {inFlight ? (
+              <><Loader2 className="w-4 h-4 animate-spin" /> {statusLabel}</>
+            ) : (
+              approveVote ? <><CheckCircle className="w-4 h-4" /> Confirm Approve</> : <><XCircle className="w-4 h-4" /> Confirm Reject</>
+            )}
+          </motion.button>
+          {voteError && (
+            <p className="text-xs text-reject">{formatError(voteError as Error)}</p>
+          )}
+        </div>
+      )}
+
+      <button onClick={onCancel} className="w-full py-2 text-xs text-muted-foreground hover:text-foreground transition-colors font-medium">
+        Cancel
+      </button>
+    </div>
+  );
+}
 
 // ── Approve + Commit + Create flow ───────────────────────────────────────────
 //
@@ -879,7 +1128,7 @@ function ApproveAndCreate({ durationSecs, address, onSuccess, challengeName, cha
           {approveError && (
             <p className="text-xs text-reject flex items-center gap-1">
               <AlertCircle className="w-3.5 h-3.5" />
-              {(approveError as Error).message?.split("\n")[0]?.slice(0, 100)}
+              {formatError(approveError as Error)}
             </p>
           )}
           {approveSuccess && (
@@ -916,7 +1165,7 @@ function ApproveAndCreate({ durationSecs, address, onSuccess, challengeName, cha
           {createError && (
             <p className="text-xs text-reject flex items-center gap-1">
               <AlertCircle className="w-3.5 h-3.5" />
-              {(createError as Error).message?.split("\n")[0]?.slice(0, 100)}
+              {formatError(createError as Error)}
             </p>
           )}
           {createConfirmed && (
@@ -991,9 +1240,9 @@ const CreateModal = ({ onClose, onRefetch }: { onClose: () => void; onRefetch: (
           <div className="flex items-start gap-3 p-4 rounded-2xl bg-accent/10 border border-accent/20 mb-6">
             <Coins className="w-5 h-5 text-accent mt-0.5 shrink-0" />
             <div>
-              <p className="text-sm font-semibold text-foreground">1 USDC will be staked</p>
+              <p className="text-sm font-semibold text-foreground">Creating a challenge requires a 1.00 USDC stake</p>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Your challenge name & description are uploaded to IPFS so everyone can see them. Uses Sepolia testnet USDC.
+                If approved: you get your stake back + bonus from reject voters. If rejected: you lose your stake. Uses Sepolia testnet USDC.
               </p>
             </div>
           </div>
@@ -1173,9 +1422,9 @@ function useChallenges() {
     results.forEach((r, i) => {
       if (r.status === "success" && r.result) {
         // New struct: creator, proofSubmitted, resolved, success, creatorClaimed,
-        //             approveVotes, rejectVotes, correctVoterCount, deadline, votingDeadline
-        const [creator, proofSubmitted, resolved, success, _creatorClaimed, approveVotes, rejectVotes, _correctVoterCount, deadline, votingDeadline] =
-          r.result as readonly [string, boolean, boolean, boolean, boolean, bigint, bigint, number, bigint, bigint];
+        //             approveVotes, rejectVotes, correctVoterCount, deadline, votingDeadline, creatorPrizePool, voterPrizePool
+        const [creator, proofSubmitted, resolved, success, creatorClaimed, approveVotes, rejectVotes, _correctVoterCount, deadline, votingDeadline, creatorPrizePool, voterPrizePool] =
+          r.result as readonly [string, boolean, boolean, boolean, boolean, bigint, bigint, number, bigint, bigint, bigint, bigint];
         const id = i + 1;
         const eventCIDs = cidMap[id] ?? {};
         challenges.push({
@@ -1185,6 +1434,7 @@ function useChallenges() {
           proofCID: eventCIDs.proofCID ?? "",
           approveVotes: Number(approveVotes), rejectVotes: Number(rejectVotes),
           proofSubmitted, resolved, success,
+          creatorClaimed, creatorPrizePool, voterPrizePool,
         });
       }
     });
@@ -1195,7 +1445,7 @@ function useChallenges() {
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 export default function Index() {
-  const { challenges, isLoading, total, refetch: refetchChallenges } = useChallenges();
+  const { challenges, isLoading, total, refetch } = useChallenges();
   const meta = useChallengesMeta(challenges);
   const [selected, setSelected] = useState<Challenge | null>(null);
   const [showCreate, setShowCreate] = useState(false);
