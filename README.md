@@ -1,130 +1,117 @@
 # 🌿 Proof of Touch Grass
 
-A decentralized accountability protocol on Ethereum where users stake USDC to prove they touched grass — verified by community voting with skin-in-the-game incentives.
+> Putting your money where your feet are.
 
 ---
 
-## 📖 Overview
+## What is this?
 
-Proof of Touch Grass (POTG) is a smart contract system that:
+Your therapist said go outside.
+Your friends said touch grass.
+You said "ok but what if I staked USDC on it."
 
-- Lets users **create challenges** by staking **1 USDC**
-- Allows the creator to **submit photo/video proof** via IPFS
-- Enables the community to **vote on proof validity** by staking **0.1 USDC**
-- **Rewards honest voters** and **punishes dishonest ones**
-- Gives creators a **bonus** if they succeed (from losing voters' stakes)
+This is that.
 
----
+**Proof of Touch Grass** is a fully on-chain accountability protocol where you stake real money to prove you went outside — and strangers on Ethereum decide if you actually did.
 
-## 🏗️ How It Works
-
-### Challenge Lifecycle
-Create Challenge → Submit Proof → Community Votes → Resolve → Claim
-
-### 1. Create Challenge
-- Creator stakes **1 USDC**
-- Sets a deadline to submit proof
-- Uploads metadata (name, description, image) to IPFS via Pinata
-- Passes the IPFS CID to the contract
-
-### 2. Submit Proof
-- Creator uploads proof photo/video to IPFS
-- Submits the proof CID before the deadline
-- A **24-hour voting window** opens
-
-### 3. Vote
-- Anyone can vote **Approve** or **Reject**
-- Each voter stakes **0.1 USDC** to vote
-- Creator cannot vote on their own challenge
-
-### 4. Resolve
-- Anyone can call `resolve()` after the voting window closes
-- Outcome is determined by majority vote
-
-### 5. Claim
-
-| Outcome | Creator | Approve Voters | Reject Voters |
-|---|---|---|---|
-| ✅ Approved | Gets 1 USDC back + reject pool bonus | Gets 0.1 USDC back | Loses 0.1 USDC |
-| ❌ Rejected | Loses 1 USDC | Loses 0.1 USDC | Gets 0.1 USDC back + share of prize pool |
+No pressure. Just your USDC on the line.
 
 ---
 
-## 💰 Reward Model
+## How it works
 
-### On Approve (majority approve)
-Creator stakes    :  1.00 USDC
-5 approve voters  :  5 × 0.10 = 0.50 USDC
-3 reject voters   :  3 × 0.10 = 0.30 USDC ← lose this
-reject pool       =  0.30 USDC
-protocol fee (5%) =  0.015 USDC → treasury
-creator receives  =  1.00 + 0.30 - 0.015 = 1.285 USDC ✅
-approve voters    =  0.10 USDC each (stake returned) ✅
-reject voters     =  0.00 USDC ❌
+Stake 1 USDC → create a challenge
+Actually go outside → upload photo proof to IPFS
+Strangers vote on your proof → they stake 0.10 USDC to do so
+Honest voters win money → dishonest voters lose money
+Touch grass → get paid → repeat
 
-### On Reject (majority reject)
-Creator stakes    :  1.00 USDC ← loses this
-4 approve voters  :  4 × 0.10 = 0.40 USDC ← lose this
-6 reject voters   :  6 × 0.10 = 0.60 USDC ← get back + bonus
-prize pool        =  1.00 + 0.40 = 1.40 USDC
-protocol fee (5%) =  0.07 USDC → treasury
-voter prize       =  1.33 USDC shared by 6 voters
-each reject voter =  0.10 + (1.33 / 6) = 0.3217 USDC ✅
-approve voters    =  0.00 USDC ❌
-creator           =  0.00 USDC ❌
+
+It's a gym buddy. But the gym buddy is Ethereum.
+And if they lie, they lose money.
+And so do you.
 
 ---
 
-## 🔐 Security Features
+## The Incentive Model (aka why nobody cheats)
 
-| Feature | Implementation |
+### ✅ If your proof gets APPROVED
+
+| Who | What happens |
 |---|---|
-| Reentrancy protection | `uint256` guard (cheaper than `bool`) |
-| Safe token transfers | OpenZeppelin `SafeERC20` |
-| Checks-Effects-Interactions | All state updated before external calls |
-| Input validation | CID length checks (46–128 bytes) |
-| Access control | `onlyOwner` modifier for treasury |
-| Per-challenge prize pools | No cross-challenge fund leakage |
-| Custom errors | EIP-838 (saves gas vs require strings) |
+| You (creator) | Get 1 USDC back + bonus from reject voters |
+| Approve voters | Get their 0.10 USDC stake back |
+| Reject voters | Lose their 0.10 USDC. Should have believed you. |
+
+### ❌ If your proof gets REJECTED
+
+| Who | What happens |
+|---|---|
+| You (creator) | Lose 1 USDC. Should have touched grass. |
+| Reject voters | Get their stake back + share your 1 USDC |
+| Approve voters | Lose their 0.10 USDC. Should have looked harder. |
+
+### The math
+You submitted fake grass (a houseplant).
+5 people approved. 3 people rejected.
+reject pool  = 3 × 0.10 = 0.30 USDC
+fee (5%)     = 0.015 USDC → protocol treasury
+your bonus   = 1.00 + 0.30 - 0.015 = 1.285 USDC
+You profited 0.285 USDC and fooled nobody.
+The houseplant is proud of you.
+
+Nobody can lie without losing money.
+Nobody can vote lazily without skin in the game.
+This is just capitalism but for going outside.
 
 ---
 
-## 📦 Contract Details
+## Tech Stack
 
-| Parameter | Value |
-|---|---|
-| Creator Stake | 1 USDC (1,000,000 units) |
-| Voter Stake | 0.1 USDC (100,000 units) |
-| Voting Duration | 24 hours |
-| Protocol Fee | 5% of losing stakes |
-| Min CID Length | 46 characters |
-| Max CID Length | 128 characters |
-
-### Contract Functions
-
-| Function | Description |
-|---|---|
-| `createChallenge(duration, metadataCID)` | Create a new challenge with 1 USDC stake |
-| `submitProof(challengeId, proofCID)` | Submit IPFS proof before deadline |
-| `vote(challengeId, approve)` | Vote on proof with 0.1 USDC stake |
-| `resolve(challengeId)` | Finalise challenge after voting window |
-| `claim(challengeId)` | Creator claims stake + bonus on success |
-| `claimVoterReward(challengeId)` | Winning voter claims stake + reward |
-| `withdrawTreasury(to, amount)` | Owner withdraws protocol fees |
-| `previewPayout(challengeId, address)` | Preview claimable amount before claiming |
-| `hasVoted(challengeId, address)` | Check if address has voted |
-| `getVoteChoice(challengeId, address)` | Get vote choice for an address |
+- **Solidity 0.8.20** — the grass is greener on the EVM
+- **OpenZeppelin SafeERC20** — because unsafe token transfers are not grass
+- **USDC** — stable like a well-rooted tree
+- **IPFS + Pinata** — your proof lives forever on a decentralized forest
+- **Hardhat** — for when you need to hammer things into the blockchain
+- **React** — because someone has to make it pretty
 
 ---
 
-## 🚀 Deployment
+## Gas Optimizations
+
+Because every wei saved is a wei earned:
+
+- 🗜️ Tight struct packing — 3 storage slots instead of 12
+- ⚡ `uint256` reentrancy guard — cheaper than `bool` by ~18,000 gas
+- 🗳️ Single mapping encodes vote + choice — saves one cold SSTORE per vote
+- 📢 Strings emitted as events only — not stored on-chain
+- ❌ Custom errors over `require` strings — smaller bytecode, cheaper reverts
+- 🔢 `unchecked` arithmetic where safe — because Solidity 0.8 already has your back
+
+---
+
+## Security
+
+- ✅ Reentrancy protected
+- ✅ Checks-Effects-Interactions pattern
+- ✅ SafeERC20 for all token transfers
+- ✅ Per-challenge prize pools (no cross-challenge fund leakage)
+- ✅ CID validation on all IPFS inputs
+- ✅ Access control on treasury withdrawal
+
+Audited by: me, at 2am, with coffee.
+Use at your own risk. Touch grass at your own discretion.
+
+---
+
+## Getting Started
 
 ### Prerequisites
-- Node.js v18 or v20 (Hardhat 2 does not support Node v24)
-- npm
-- A wallet with Sepolia ETH (min 0.03 ETH for deployment)
-- Alchemy API key for Sepolia RPC
-- Etherscan API key for contract verification
+
+- Node.js v18 or v20 (not v24 — Hardhat has opinions)
+- A wallet with Sepolia ETH (beg for it at a faucet)
+- An Alchemy API key (free)
+- The willingness to touch grass
 
 ### Installation
 
@@ -136,47 +123,44 @@ npm install
 
 ### Environment Setup
 
-Create a `.env` file in the root directory:
-
 ```bash
-PRIVATE_KEY=your_wallet_private_key_without_0x
-SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/your_alchemy_key
-ETHERSCAN_API_KEY=your_etherscan_api_key
+cp .env.example .env
 ```
 
-### Compile
-
+Fill in `.env`:
 ```bash
-npx hardhat compile
+PRIVATE_KEY=your_private_key        # don't commit this. seriously.
+SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/your_key
+ETHERSCAN_API_KEY=your_etherscan_key
 ```
 
 ### Deploy
 
 ```bash
-# Sepolia testnet
+npx hardhat compile
 npx hardhat run scripts/deploy.js --network sepolia
-
-# Base Sepolia testnet
-npx hardhat run scripts/deploy.js --network baseSepolia
-
-# Mainnet (when ready)
-npx hardhat run scripts/deploy.js --network base
 ```
 
-### Verify on Etherscan
-
-```bash
-npx hardhat verify --network sepolia <CONTRACT_ADDRESS> <USDC_ADDRESS>
-
-# Example
-npx hardhat verify --network sepolia 0xYourContract 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238
-```
+If it fails, you probably need more Sepolia ETH.
+Go to https://sepoliafaucet.com and touch digital grass.
 
 ---
 
-## 🌐 USDC Addresses
+## Contract Details
 
-| Network | USDC Address |
+| Thing | Value |
+|---|---|
+| Creator Stake | 1.00 USDC |
+| Voter Stake | 0.10 USDC |
+| Voting Window | 24 hours |
+| Protocol Fee | 5% of losing stakes |
+| Deployed on | Sepolia Testnet |
+
+---
+
+## USDC Addresses
+
+| Network | Address |
 |---|---|
 | Ethereum Mainnet | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` |
 | Base Mainnet | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
@@ -185,62 +169,43 @@ npx hardhat verify --network sepolia 0xYourContract 0x1c7D4B196Cb0C7B01d743Fbc61
 
 ---
 
-## 🗂️ IPFS Metadata Format
-
-Metadata uploaded to Pinata must follow this structure:
-
-```json
-{
-  "name": "My Grass Challenge",
-  "description": "I will touch grass every day for a week",
-  "image": "ipfs://QmYourImageCIDHere"
-}
-```
-
-Upload flow:
-
-Upload image → get imageCID
-Build JSON with imageCID
-Upload JSON → get metadataCID
-Pass metadataCID to createChallenge()
-
-
----
-
-## 🗃️ Project Structure
+## Project Structure
 proof-of-touch-grass/
 ├── contracts/
-│   └── ProofOfTouchGrass.sol    # Main contract
+│   └── ProofOfTouchGrass.sol   # where the magic lives
 ├── scripts/
-│   └── deploy.js                # Deployment script
-├── test/
-│   └── ProofOfTouchGrass.js     # Test suite
-├── .env                         # Environment variables (never commit)
-├── .gitignore
-├── hardhat.config.js            # Hardhat configuration
-├── package.json
-└── README.md
+│   └── deploy.js               # sends it to the blockchain
+├── Frontend/
+│   └── src/                    # makes it look good
+├── .env                        # DO NOT COMMIT
+├── hardhat.config.js
+└── README.md                   # you are here
 
 ---
 
-## 🧪 Running Tests
+## FAQ
 
-```bash
-npx hardhat test
-```
+**Q: Do I actually have to touch grass?**
+A: Yes. That's the whole point.
+
+**Q: What if I submit a photo of fake grass?**
+A: The community will reject you. And your 1 USDC.
+
+**Q: What if the community is wrong?**
+A: That's a philosophical question for which we charge 5%.
+
+**Q: Is this audited?**
+A: It has been reviewed more carefully than most things in DeFi. That's either reassuring or terrifying depending on your DeFi experience.
+
+**Q: Why USDC and not ETH?**
+A: Because grass prices are stable. Unlike ETH.
 
 ---
 
-## ⚠️ Important Notes
+## License
 
-- **Never commit your `.env` file** — add it to `.gitignore`
-- Always approve USDC spending before calling `createChallenge` or `vote`
-- Voters must call `claimVoterReward` manually after resolution
-- The `resolve` function is permissionless — anyone can call it after the voting window
-- Protocol fees accumulate in the contract and can only be withdrawn by the owner
+MIT — do whatever you want, just go outside first.
 
 ---
 
-## 📄 License
-
-MIT
+*Built by someone who clearly needed to touch more grass.*
